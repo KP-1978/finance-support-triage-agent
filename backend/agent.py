@@ -68,14 +68,24 @@ ENTITIES — Extract (set null if not found):
   • transaction_id — any transaction/reference ID (e.g. TXN-12345)
   • amount         — monetary amount (e.g. "$500.00")
 
-PRIORITY:
-  • High   — fraud, theft, unauthorised transactions, account compromise
-  • Medium — billing errors, payment failures, refund requests, disputes
-  • Low    — general enquiries, account info requests, feedback
+PRIORITY (CRITICAL — follow these rules exactly):
+  • High   — ANY of these: fraud, theft, unauthorised transactions, account
+              compromise, security breach, stolen card, payment failed but money
+              deducted, large failed transfers, salary/rent payment failures,
+              refund not received/credited, account lockout with urgent need,
+              billing error (charged after cancellation), critical transaction
+              failures. If money is lost, stuck, or at risk → ALWAYS High.
+  • Medium — disputes without money loss, app/feature malfunctions, KYC/document
+              issues, non-critical payment questions, chargeback requests where
+              money is safe.
+  • Low    — general enquiries, information requests, feedback, feature requests,
+              status checks, statement requests, thank-you notes.
 
 CATEGORY:
-  • Fraud         — fraud, theft, unauthorised access, suspicious activity
-  • Payment Issue — billing errors, refund requests, payment failures, disputes
+  • Fraud         — fraud, theft, unauthorised access, suspicious activity,
+                     security breach, stolen card, identity theft
+  • Payment Issue — billing errors, refund requests, payment failures, disputes,
+                     failed transfers, subscription charges, account lockout
   • General       — all other enquiries
 
 SUMMARY — Concise 1-2 sentence summary for the support agent.
@@ -126,7 +136,12 @@ customer email and return a structured JSON report.
 SENTIMENT — Exactly one of: Positive, Negative, Neutral, Urgent
 INTENT — Short phrase (5-10 words) describing what the customer wants.
 ENTITIES — Extract customer_name, transaction_id, amount (null if not found).
-PRIORITY — High (fraud/theft), Medium (billing/payment), Low (general).
+PRIORITY (follow strictly):
+  High — fraud, security breach, payment failed + money deducted, refund not
+         received, account lockout, billing error, any situation where money
+         is lost/stuck/at risk.
+  Medium — disputes (money safe), app bugs, KYC issues.
+  Low — general questions, feedback, status checks, statements.
 CATEGORY — Fraud, Payment Issue, or General.
 SUMMARY — 1-2 sentence summary.
 """

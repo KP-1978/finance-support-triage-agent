@@ -13,6 +13,7 @@ from models import Ticket, TicketStatus, TicketPriority, TicketCategory
 from schemas import AnalyzeRequest, TicketAnalysis, ProcessTicketResponse
 from agent import analyze_ticket, generate_draft_response, analyze_and_draft
 from ocr import extract_text_from_image, SUPPORTED_CONTENT_TYPES
+from urgency_classifier import classify_urgency, get_parent_category
 
 load_dotenv()
 
@@ -87,9 +88,37 @@ def send_reply_email(to_email: str, subject: str, body: str) -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Create database tables on startup (if they don't exist)."""
+    """Create database tables on startup and run lightweight migrations."""
+    from sqlalchemy import text, inspect as sa_inspect
     print("📦 Creating database tables...")
     Base.metadata.create_all(bind=engine)
+
+    # ── Lightweight migrations for existing databases ──
+    with engine.begin() as conn:
+        # 1. Add 'Open' to ticket_status enum if missing
+        try:
+            conn.execute(text(
+                "ALTER TYPE ticket_status ADD VALUE IF NOT EXISTS 'Open'"
+            ))
+        except Exception:
+            pass  # already exists or DB doesn't support ALTER TYPE
+
+        # 2. Add is_read column if missing
+        inspector = sa_inspect(engine)
+        columns = [c["name"] for c in inspector.get_columns("tickets")]
+        if "is_read" not in columns:
+            conn.execute(text(
+                "ALTER TABLE tickets ADD COLUMN is_read BOOLEAN NOT NULL DEFAULT FALSE"
+            ))
+            print("  ✅ Added is_read column to tickets table.")
+
+        # 3. Add is_ai_draft_edited column if missing
+        if "is_ai_draft_edited" not in columns:
+            conn.execute(text(
+                "ALTER TABLE tickets ADD COLUMN is_ai_draft_edited BOOLEAN NOT NULL DEFAULT FALSE"
+            ))
+            print("  ✅ Added is_ai_draft_edited column to tickets table.")
+
     print("✅ Database tables are ready.")
     yield
 
@@ -114,6 +143,193 @@ app.add_middleware(
 @app.get("/")
 def root():
     return {"message": "Finance Agent is Running"}
+
+
+# =====================================================================
+#  ENTERPRISE DASHBOARD METRICS
+# =====================================================================
+
+def _parse_amount(amount_str: str | None) -> float:
+    """Extract a numeric dollar value from a string like '$3,000.00' or '3000'."""
+    if not amount_str:
+        return 0.0
+    cleaned = re.sub(r'[^\d.]', '', amount_str)
+    try:
+        return float(cleaned)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _extract_merchants(email_body: str) -> list[str]:
+    """Extract likely merchant/company names from an email body."""
+    known = [
+        "PayPal", "Uber", "Amazon", "Netflix", "Stripe", "Venmo", "Zelle",
+        "Cash App", "Apple Pay", "Google Pay", "Square", "Shopify", "Razorpay",
+        "Coinbase", "Robinhood", "Wise", "Western Union", "MoneyGram",
+        "Chase", "Wells Fargo", "Bank of America", "Citi", "HDFC", "ICICI",
+        "SBI", "PhonePe", "Paytm", "GPay", "Flipkart", "Swiggy", "Zomato",
+    ]
+    found = []
+    if not email_body:
+        return found
+    body_lower = email_body.lower()
+    for m in known:
+        if m.lower() in body_lower:
+            found.append(m)
+    return found
+
+
+def calculate_dashboard_metrics(db: Session) -> dict:
+    """
+    Compute enterprise-grade financial & operational KPIs from the tickets table.
+
+    Returns a dict consumed by the /dashboard_metrics endpoint.
+    """
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    from collections import Counter as _Counter
+
+    all_tickets = db.query(Ticket).order_by(Ticket.created_at.desc()).all()
+    now = _dt.now(_tz.utc)
+
+    _OPEN = {TicketStatus.OPEN, TicketStatus.NEW, TicketStatus.IN_PROGRESS}
+    _CLOSED = {TicketStatus.RESOLVED, TicketStatus.CLOSED}
+
+    open_tickets = [t for t in all_tickets if t.status in _OPEN]
+    closed_tickets = [t for t in all_tickets if t.status in _CLOSED]
+    fraud_tickets = [t for t in all_tickets if t.category == TicketCategory.FRAUD]
+    fraud_open = [t for t in fraud_tickets if t.status in _OPEN]
+
+    # ── 1. Total Disputed Volume (sum of amounts for open tickets) ──
+    total_disputed = sum(_parse_amount(t.amount) for t in open_tickets)
+
+    # ── 2. SLA Breaches (High priority, open > 4 hours) ──
+    sla_threshold = now - _td(hours=4)
+    sla_breaches = [
+        t for t in open_tickets
+        if t.priority == TicketPriority.HIGH
+        and t.created_at
+        and t.created_at < sla_threshold
+    ]
+
+    # ── 3. Fraud Exposure (sum of amounts for ALL fraud tickets) ──
+    fraud_exposure = sum(_parse_amount(t.amount) for t in fraud_tickets)
+    fraud_open_value = sum(_parse_amount(t.amount) for t in fraud_open)
+
+    # ── 4. AI Success Rate (closed tickets where draft was NOT edited) ──
+    ai_used = sum(1 for t in closed_tickets if not t.is_ai_draft_edited)
+    ai_success_rate = (ai_used / len(closed_tickets) * 100) if closed_tickets else 0.0
+
+    # ── 5. Avg Resolution Time ──
+    resolution_hours = []
+    for t in closed_tickets:
+        if t.created_at:
+            delta = (now - t.created_at).total_seconds() / 3600
+            resolution_hours.append(delta)
+    avg_resolution_h = sum(resolution_hours) / len(resolution_hours) if resolution_hours else 0
+
+    # ── 6. Volume by Hour (last 48 hours) ──
+    cutoff_48h = now - _td(hours=48)
+    hourly_counts: dict[str, int] = {}
+    for t in all_tickets:
+        if t.created_at and t.created_at >= cutoff_48h:
+            hour_key = t.created_at.strftime("%Y-%m-%d %H:00")
+            hourly_counts[hour_key] = hourly_counts.get(hour_key, 0) + 1
+    # Fill in missing hours
+    volume_by_hour = []
+    cur = cutoff_48h.replace(minute=0, second=0, microsecond=0)
+    while cur <= now:
+        key = cur.strftime("%Y-%m-%d %H:00")
+        volume_by_hour.append({"hour": key, "count": hourly_counts.get(key, 0)})
+        cur += _td(hours=1)
+
+    # ── 7. Top Merchants / Issues ──
+    merchant_counter: _Counter = _Counter()
+    for t in all_tickets:
+        for m in _extract_merchants(t.email_body):
+            merchant_counter[m] += 1
+    top_merchants = [{"name": n, "count": c} for n, c in merchant_counter.most_common(5)]
+
+    # ── 8. Agent Leaderboard (group by customer_name as proxy for agent) ──
+    # For a real system you'd have an assigned_agent column. We
+    # simulate by treating unique customer_name groups as workload buckets.
+    # In this MVP, the leaderboard shows category-level performance.
+    category_perf = []
+    for cat in [TicketCategory.FRAUD, TicketCategory.PAYMENT_ISSUE, TicketCategory.GENERAL]:
+        cat_all = [t for t in all_tickets if t.category == cat]
+        cat_closed = [t for t in cat_all if t.status in _CLOSED]
+        cat_avg_h = 0.0
+        if cat_closed:
+            deltas = []
+            for t in cat_closed:
+                if t.created_at:
+                    deltas.append((now - t.created_at).total_seconds() / 3600)
+            cat_avg_h = sum(deltas) / len(deltas) if deltas else 0
+        reopen = sum(1 for t in cat_all if t.status == TicketStatus.OPEN)
+        category_perf.append({
+            "category": cat.value,
+            "total": len(cat_all),
+            "closed": len(cat_closed),
+            "avg_resolution_h": round(cat_avg_h, 1),
+            "reopen_count": reopen,
+            "reopen_rate": round(reopen / len(cat_all) * 100, 1) if cat_all else 0,
+        })
+
+    # ── 9. SLA breach detail list ──
+    sla_detail = []
+    for t in sla_breaches:
+        hrs_open = (now - t.created_at).total_seconds() / 3600 if t.created_at else 0
+        sla_detail.append({
+            "id": str(t.id),
+            "customer_name": t.customer_name,
+            "amount": t.amount,
+            "hours_open": round(hrs_open, 1),
+            "category": t.category.value if t.category else "General",
+        })
+
+    return {
+        "total_tickets": len(all_tickets),
+        "open_tickets": len(open_tickets),
+        "closed_tickets": len(closed_tickets),
+        "total_disputed_volume": round(total_disputed, 2),
+        "sla_breaches": len(sla_breaches),
+        "sla_breach_detail": sla_detail,
+        "fraud_alerts_open": len(fraud_open),
+        "fraud_exposure_total": round(fraud_exposure, 2),
+        "fraud_exposure_open": round(fraud_open_value, 2),
+        "ai_success_rate": round(ai_success_rate, 1),
+        "ai_drafts_used": ai_used,
+        "avg_resolution_h": round(avg_resolution_h, 1),
+        "volume_by_hour": volume_by_hour,
+        "top_merchants": top_merchants,
+        "category_performance": category_perf,
+    }
+
+
+@app.get("/dashboard_metrics")
+def dashboard_metrics(db: Session = Depends(get_db)):
+    """Enterprise-grade dashboard metrics for the Finance Triage analytics page."""
+    try:
+        return calculate_dashboard_metrics(db)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Metrics calculation failed: {str(e)}")
+
+
+@app.post("/classify_urgency")
+def classify_urgency_endpoint(request: AnalyzeRequest):
+    """
+    Advanced multi-tier urgency classification (3 tiers × 12 sub-categories).
+
+    Returns JSON: {urgency, subcategory, confidence, reasoning, sla}
+    Targets < 500 ms latency. Falls back to Medium on errors.
+    """
+    try:
+        result = classify_urgency(request.email_body)
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Urgency classification failed: {str(e)}",
+        )
 
 
 @app.post("/analyze", response_model=TicketAnalysis)
@@ -151,6 +367,61 @@ _CATEGORY_MAP = {
 }
 
 
+def _resolve_priority(email_text: str, agent_priority: str, agent_category: str):
+    """
+    Two-pass priority resolution:
+      1. Agent (llama-3.3-70b) provides initial priority + category.
+      2. Urgency classifier (llama-3.1-8b, 12 sub-categories) runs as a
+         fast second opinion.
+
+    Rules:
+      • If the classifier returns a HIGHER urgency than the agent → promote.
+      • If the classifier has confidence >= 0.75 → trust it outright.
+      • Otherwise keep the agent's original priority.
+      • Also return the classifier's subcategory + SLA for metadata.
+    """
+    try:
+        clf = classify_urgency(email_text)
+    except Exception:
+        # Classifier failed — fall back to agent's judgement
+        return agent_priority, agent_category, None
+
+    clf_urgency = clf["urgency"]
+    clf_confidence = clf["confidence"]
+    clf_subcat = clf["subcategory"]
+    clf_sla = clf["sla"]
+
+    # Numeric ranking: High=3, Medium=2, Low=1
+    _rank = {"High": 3, "Medium": 2, "Low": 1}
+    agent_rank = _rank.get(agent_priority, 2)
+    clf_rank = _rank.get(clf_urgency, 2)
+
+    # Decide final priority
+    if clf_confidence >= 0.75:
+        # High-confidence classifier result takes precedence
+        final_priority = clf_urgency
+    elif clf_rank > agent_rank:
+        # Classifier sees higher urgency — always promote
+        final_priority = clf_urgency
+    else:
+        final_priority = agent_priority
+
+    # Optionally upgrade category based on subcategory
+    final_category = agent_category
+    parent_cat = get_parent_category(clf_subcat)
+    if final_priority == "High" and parent_cat == "Fraud" and agent_category != "Fraud":
+        final_category = "Fraud"
+    elif final_priority == "High" and parent_cat == "Payment Issue" and agent_category == "General":
+        final_category = "Payment Issue"
+
+    return final_priority, final_category, {
+        "subcategory": clf_subcat,
+        "sla": clf_sla,
+        "confidence": clf_confidence,
+        "reasoning": clf["reasoning"],
+    }
+
+
 @app.post("/process_ticket", response_model=ProcessTicketResponse)
 def process_ticket(request: AnalyzeRequest, db: Session = Depends(get_db)):
     """
@@ -175,14 +446,19 @@ def process_ticket(request: AnalyzeRequest, db: Session = Depends(get_db)):
             detail=f"Analysis failed: {str(e)}",
         )
 
-    # ---- Step 3: Save to database ----
+    # ---- Step 3: Priority override via urgency classifier ----
+    final_pri, final_cat, clf_meta = _resolve_priority(
+        request.email_body, analysis.priority.value, analysis.category.value,
+    )
+
+    # ---- Step 4: Save to database ----
     try:
         ticket = Ticket(
             customer_name=analysis.entities.customer_name or "Unknown",
             email_body=request.email_body,
             status="New",
-            priority=_PRIORITY_MAP.get(analysis.priority.value, TicketPriority.MEDIUM),
-            category=_CATEGORY_MAP.get(analysis.category.value, TicketCategory.GENERAL),
+            priority=_PRIORITY_MAP.get(final_pri, TicketPriority.MEDIUM),
+            category=_CATEGORY_MAP.get(final_cat, TicketCategory.GENERAL),
             sentiment=analysis.sentiment.value,
             intent=analysis.intent,
             summary=analysis.summary,
@@ -258,14 +534,19 @@ async def process_ticket_image(
             detail=f"Analysis failed: {str(e)}",
         )
 
-    # ---- Step 4: Save to database ----
+    # ---- Step 4: Priority override via urgency classifier ----
+    final_pri, final_cat, clf_meta = _resolve_priority(
+        extracted_text, analysis.priority.value, analysis.category.value,
+    )
+
+    # ---- Step 5: Save to database ----
     try:
         ticket = Ticket(
             customer_name=analysis.entities.customer_name or "Unknown",
             email_body=extracted_text,
             status="New",
-            priority=_PRIORITY_MAP.get(analysis.priority.value, TicketPriority.MEDIUM),
-            category=_CATEGORY_MAP.get(analysis.category.value, TicketCategory.GENERAL),
+            priority=_PRIORITY_MAP.get(final_pri, TicketPriority.MEDIUM),
+            category=_CATEGORY_MAP.get(final_cat, TicketCategory.GENERAL),
             sentiment=analysis.sentiment.value,
             intent=analysis.intent,
             summary=analysis.summary,
@@ -312,27 +593,45 @@ def _ticket_to_dict(ticket: Ticket) -> dict:
         "transaction_id": ticket.transaction_id,
         "amount": ticket.amount,
         "draft_response": ticket.draft_response,
+        "is_read": ticket.is_read if ticket.is_read is not None else False,
+        "is_ai_draft_edited": ticket.is_ai_draft_edited if ticket.is_ai_draft_edited is not None else False,
         "created_at": ticket.created_at.isoformat() if ticket.created_at else None,
     }
 
 
 @app.get("/tickets")
 def list_tickets(
-    status: Optional[str] = Query(None, description="Filter by status: New, In Progress, Resolved, Closed"),
+    status: Optional[str] = Query(None, description="Filter by status: Open, New, In Progress, Resolved, Closed"),
     db: Session = Depends(get_db),
 ):
-    """Return all tickets, optionally filtered by status."""
+    """Return all tickets, optionally filtered by status.
+
+    Convenience aliases:
+      ?status=open      → all unresolved tickets (Open + New + In Progress)
+      ?status=resolved   → only Resolved tickets
+    """
     query = db.query(Ticket).order_by(Ticket.created_at.desc())
 
     if status:
-        try:
-            status_enum = TicketStatus(status)
-            query = query.filter(Ticket.status == status_enum)
-        except ValueError:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid status '{status}'. Must be one of: New, In Progress, Resolved, Closed",
+        low = status.strip().lower()
+        # Alias: "open" matches all unresolved statuses
+        if low == "open":
+            query = query.filter(
+                Ticket.status.in_([
+                    TicketStatus.OPEN,
+                    TicketStatus.NEW,
+                    TicketStatus.IN_PROGRESS,
+                ])
             )
+        else:
+            try:
+                status_enum = TicketStatus(status)
+                query = query.filter(Ticket.status == status_enum)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid status '{status}'. Must be one of: Open, New, In Progress, Resolved, Closed",
+                )
 
     tickets = query.all()
     return [_ticket_to_dict(t) for t in tickets]
@@ -345,6 +644,19 @@ def get_ticket(ticket_id: str, db: Session = Depends(get_db)):
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
     return _ticket_to_dict(ticket)
+
+
+@app.put("/tickets/{ticket_id}/read")
+def mark_ticket_read(ticket_id: str, db: Session = Depends(get_db)):
+    """Mark a ticket as read (is_read = True). Idempotent."""
+    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    if not ticket.is_read:
+        ticket.is_read = True
+        db.commit()
+        db.refresh(ticket)
+    return {"message": "Ticket marked as read.", "ticket": _ticket_to_dict(ticket)}
 
 
 @app.patch("/tickets/{ticket_id}/approve")
@@ -376,14 +688,14 @@ def approve_and_close_ticket(ticket_id: str, db: Session = Depends(get_db)):
     elif not recipient:
         logger.warning(f"No recipient email found in ticket {ticket_id}")
 
-    ticket.status = TicketStatus.CLOSED
+    ticket.status = TicketStatus.RESOLVED
     db.commit()
     db.refresh(ticket)
 
     msg = (
-        f"Ticket approved, response sent to {recipient}, and ticket closed."
+        f"Ticket approved, response sent to {recipient}, and resolved."
         if email_sent
-        else "Ticket approved and closed, but email could not be sent."
+        else "Ticket approved and resolved, but email could not be sent."
     )
     return {
         "message": msg,
@@ -574,13 +886,18 @@ def fetch_emails_endpoint(
                         }
                     raise
 
+                # ── Priority override via urgency classifier ──
+                final_pri, final_cat, clf_meta = _resolve_priority(
+                    full_text, analysis.priority.value, analysis.category.value,
+                )
+
                 # ── Save ticket ──
                 ticket = Ticket(
                     customer_name=analysis.entities.customer_name or sender.split("<")[0].strip() or "Unknown",
                     email_body=full_text,
                     status="New",
-                    priority=_PRIORITY_MAP.get(analysis.priority.value, TicketPriority.MEDIUM),
-                    category=_CATEGORY_MAP.get(analysis.category.value, TicketCategory.GENERAL),
+                    priority=_PRIORITY_MAP.get(final_pri, TicketPriority.MEDIUM),
+                    category=_CATEGORY_MAP.get(final_cat, TicketCategory.GENERAL),
                     sentiment=analysis.sentiment.value,
                     intent=analysis.intent,
                     summary=analysis.summary,
@@ -598,10 +915,10 @@ def fetch_emails_endpoint(
                     "ticket_id": str(ticket.id),
                     "subject": subject,
                     "sender": sender,
-                    "priority": analysis.priority.value,
-                    "category": analysis.category.value,
+                    "priority": final_pri,
+                    "category": final_cat,
                 })
-                print(f"    ✅ Ticket {str(ticket.id)[:8]} | {analysis.priority.value} | {analysis.category.value}  ({_time.time()-_start:.1f}s elapsed)")
+                print(f"    ✅ Ticket {str(ticket.id)[:8]} | {final_pri} | {final_cat}  ({_time.time()-_start:.1f}s elapsed)")
             except Exception as e:
                 errors.append(f"{subject if 'subject' in dir() else 'unknown'}: {str(e)}")
                 print(f"    ❌ Error: {e}")

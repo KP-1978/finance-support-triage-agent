@@ -3,7 +3,7 @@
 -- ============================================
 
 -- Enum types for constrained columns
-CREATE TYPE ticket_status   AS ENUM ('New', 'In Progress', 'Resolved', 'Closed');
+CREATE TYPE ticket_status   AS ENUM ('Open', 'New', 'In Progress', 'Resolved', 'Closed');
 CREATE TYPE ticket_priority AS ENUM ('High', 'Medium', 'Low');
 CREATE TYPE ticket_category AS ENUM ('Fraud', 'Payment Issue', 'General');
 
@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS tickets (
     transaction_id VARCHAR(100),
     amount        VARCHAR(50),
     draft_response TEXT,
+    is_read       BOOLEAN         NOT NULL DEFAULT FALSE,
+    is_ai_draft_edited BOOLEAN    NOT NULL DEFAULT FALSE,
     created_at    TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 

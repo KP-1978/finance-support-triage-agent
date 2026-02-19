@@ -1,7 +1,7 @@
 import uuid
 import enum
 from datetime import datetime, timezone
-from sqlalchemy import Column, String, Text, Enum, DateTime
+from sqlalchemy import Boolean, Column, String, Text, Enum, DateTime
 from sqlalchemy.dialects.postgresql import UUID
 
 from database import Base
@@ -10,6 +10,7 @@ from database import Base
 # --------------- Python enums mirroring the DB enums ---------------
 
 class TicketStatus(str, enum.Enum):
+    OPEN = "Open"
     NEW = "New"
     IN_PROGRESS = "In Progress"
     RESOLVED = "Resolved"
@@ -62,6 +63,8 @@ class Ticket(Base):
     transaction_id = Column(String(100), nullable=True)
     amount = Column(String(50), nullable=True)
     draft_response = Column(Text, nullable=True)
+    is_read = Column(Boolean, nullable=False, default=False, server_default="false")
+    is_ai_draft_edited = Column(Boolean, nullable=False, default=False, server_default="false")
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,

@@ -123,29 +123,30 @@ async def lifespan(app: FastAPI):
     # ── Background email polling (Railway keeps the process alive) ──
     EMAIL_POLL_INTERVAL = int(os.getenv("EMAIL_POLL_INTERVAL", "300"))  # seconds (5 min)
     ENABLE_EMAIL_POLLING = os.getenv("ENABLE_EMAIL_POLLING", "true").lower() == "true"
+    _BACKEND_PORT = os.getenv("PORT", "8000")
 
     async def _background_email_poller():
         """Periodically fetch emails via IMAP in the background."""
-        import time as _time
-        await asyncio.sleep(10)  # let the server fully start
+        await asyncio.sleep(15)  # let the server fully start
         logger.info(f"📧 Background email poller started (interval={EMAIL_POLL_INTERVAL}s)")
         while True:
             try:
-                # Call the same logic as /fetch_emails but via internal function
                 import requests as _req
                 resp = _req.post(
-                    "http://127.0.0.1:8000/fetch_emails?max_emails=10",
-                    timeout=120,
+                    f"http://127.0.0.1:{_BACKEND_PORT}/fetch_emails?max_emails=5",
+                    timeout=300,  # 5 min timeout (AI analysis can be slow)
                 )
                 if resp.ok:
                     data = resp.json()
                     fetched = data.get("fetched", 0)
                     if fetched > 0:
                         logger.info(f"📬 Background poller: {fetched} new email(s) processed")
+                    else:
+                        logger.debug("📧 No new emails")
                 else:
                     logger.warning(f"📧 Background poller: API returned {resp.status_code}")
             except Exception as e:
-                logger.warning(f"📧 Background poller error: {e}")
+                logger.warning(f"📧 Background poller error (will retry): {e}")
             await asyncio.sleep(EMAIL_POLL_INTERVAL)
 
     poll_task = None

@@ -1,0 +1,39 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+env/
+
+# Environment / secrets
+.env
+.env.example
+backend/.env
+
+# Database (local SQLite)
+*.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docs / non-essential
+README.md
+*.md
+
+# Streamlit Cloud files (not needed on Railway)
+.streamlit/secrets.toml
+streamlit_app.py

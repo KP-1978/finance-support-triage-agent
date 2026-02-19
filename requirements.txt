@@ -12,11 +12,6 @@ python-multipart
 groq
 requests
 
-# ── OCR ──
-easyocr
-Pillow
-numpy
-
 # ── Frontend (Streamlit Dashboard) ──
 streamlit
 streamlit-autorefresh

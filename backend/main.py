@@ -12,7 +12,6 @@ from database import engine, Base, get_db
 from models import Ticket, TicketStatus, TicketPriority, TicketCategory
 from schemas import AnalyzeRequest, TicketAnalysis, ProcessTicketResponse
 from agent import analyze_ticket, generate_draft_response, analyze_and_draft
-from ocr import extract_text_from_image, SUPPORTED_CONTENT_TYPES
 from urgency_classifier import classify_urgency, get_parent_category
 
 load_dotenv()
@@ -529,92 +528,12 @@ def process_ticket(request: AnalyzeRequest, db: Session = Depends(get_db)):
     )
 
 
-@app.post("/process_ticket_image", response_model=ProcessTicketResponse)
-async def process_ticket_image(
-    file: UploadFile = File(..., description="Image file of the customer email (PNG, JPG, TIFF, BMP, WebP)"),
-    db: Session = Depends(get_db),
-):
-    """
-    End-to-end ticket processing from an **image upload**:
-
-    1. **OCR** — Extract text from the uploaded image.
-    2. **Analyse** — Run AI analysis on the extracted text.
-    3. **Draft** — Generate a personalised email reply.
-    4. **Save** — Persist the ticket to the database.
-    5. **Return** — Send back the ticket ID, extracted text, analysis, and draft.
-    """
-    # ---- Validate file type ----
-    if file.content_type not in SUPPORTED_CONTENT_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Unsupported file type '{file.content_type}'. "
-                f"Accepted types: {', '.join(sorted(SUPPORTED_CONTENT_TYPES))}"
-            ),
-        )
-
-    # ---- Step 1: OCR — extract text from image ----
-    try:
-        image_bytes = await file.read()
-        extracted_text = extract_text_from_image(image_bytes)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"OCR extraction failed: {str(e)}",
-        )
-
-    # ---- Step 2 + 3: Analyse AND generate draft (single LLM call) ----
-    try:
-        result = analyze_and_draft(extracted_text)
-        analysis = result
-        draft = result.draft_response
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Analysis failed: {str(e)}",
-        )
-
-    # ---- Step 4: Priority override via urgency classifier ----
-    final_pri, final_cat, clf_meta = _resolve_priority(
-        extracted_text, analysis.priority.value, analysis.category.value,
-    )
-
-    # ---- Step 5: Save to database ----
-    try:
-        ticket = Ticket(
-            customer_name=analysis.entities.customer_name or "Unknown",
-            email_body=extracted_text,
-            status="New",
-            priority=_PRIORITY_MAP.get(final_pri, TicketPriority.MEDIUM),
-            category=_CATEGORY_MAP.get(final_cat, TicketCategory.GENERAL),
-            sentiment=analysis.sentiment.value,
-            intent=analysis.intent,
-            summary=analysis.summary,
-            transaction_id=analysis.entities.transaction_id,
-            amount=analysis.entities.amount,
-            draft_response=draft,
-        )
-        db.add(ticket)
-        db.commit()
-        db.refresh(ticket)
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Database save failed: {str(e)}",
-        )
-
-    # ---- Step 5: Return result ----
-    return ProcessTicketResponse(
-        ticket_id=str(ticket.id),
-        analysis=analysis,
-        draft_response=draft,
-        extracted_text=extracted_text,
-        message="Image processed via OCR, analysed, and saved successfully.",
+@app.post("/process_ticket_image")
+async def process_ticket_image():
+    """OCR image processing is disabled in this deployment to reduce build size."""
+    raise HTTPException(
+        status_code=501,
+        detail="OCR image processing is not available in this deployment. Please paste the email text directly.",
     )
 
 
